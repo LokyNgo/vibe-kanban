@@ -15,10 +15,10 @@ use crate::{
     executors::{
         AppendPrompt, AvailabilityInfo, ExecutorError, SpawnedChild, StandardCodingAgentExecutor,
         acp::{
-            AcpAgentHarnessV2,
+            AcpAgentHarnessV2, binary,
             discovery::{self, DiscoverySpec},
             registry,
-            registry::{npx_command, registry_key},
+            registry::{Launch, npx_command, registry_key},
             session_config::DesiredConfig,
         },
     },
@@ -120,7 +120,8 @@ impl StandardCodingAgentExecutor for AcpServer {
         None
     }
 
-    /// Installed means present in profiles: npx downloads the agent on first run
+    /// Installed means present in profiles: npx downloads the agent on first run, and a
+    /// binary one is downloaded again by the next spawn if its files are gone
     fn get_availability_info(&self) -> AvailabilityInfo {
         AvailabilityInfo::InstallationFound
     }
@@ -196,14 +197,24 @@ impl AcpServer {
             .into_iter()
             .find(|a| a.id == self.registry_id)
             .ok_or_else(|| ExecutorError::AcpRegistryAgentNotFound(self.registry_id.clone()))?;
-        let npx = agent
-            .distribution
-            .npx
-            .ok_or(ExecutorError::AcpRegistryAgentNotFound(
-                self.registry_id.clone(),
-            ))?;
-        let command = apply_overrides(npx_command(&self.registry_id, &npx)?, &self.cmd)?;
-        Ok((command, npx.env))
+        let (command, env) = match agent.distribution.launch() {
+            Some(Launch::Npx(npx)) => (npx_command(&self.registry_id, &npx)?, npx.env),
+            // A base override runs the user's own install, so nothing is downloaded
+            Some(Launch::Binary(target)) if self.cmd.base_command_override.is_some() => (
+                CommandBuilder::new(target.cmd).extend_params(target.args),
+                target.env,
+            ),
+            Some(Launch::Binary(target)) => (
+                binary::command(&self.registry_id, &agent.version, &target).await?,
+                target.env,
+            ),
+            None => {
+                return Err(ExecutorError::AcpRegistryAgentNotFound(
+                    self.registry_id.clone(),
+                ));
+            }
+        };
+        Ok((apply_overrides(command, &self.cmd)?, env))
     }
 
     async fn build_spawn_args(
@@ -211,15 +222,16 @@ impl AcpServer {
         prompt: &str,
         env: &ExecutionEnv,
     ) -> Result<(String, CommandBuilder, ExecutionEnv), ExecutorError> {
-        let (command, npx_env) = self.command_and_env().await?;
+        let (command, distribution_env) = self.command_and_env().await?;
         let combined_prompt = self.append_prompt.combine_prompt(prompt);
         tracing::info!(registry_id = %self.registry_id, base = %command.base, params = ?command.params, "Spawning ACP registry agent");
-        let env = env.clone().with_overrides(&npx_env);
+        let env = env.clone().with_overrides(&distribution_env);
 
         Ok((combined_prompt, command, env))
     }
 
-    /// Starts nothing, but reads the registry, which is fetched if there's no copy on disk.
+    /// Starts nothing, but reads the registry, which is fetched if there's no copy on disk,
+    /// and downloads a binary agent that isn't unpacked yet.
     async fn discovery_spec(&self) -> Result<DiscoverySpec, ExecutorError> {
         let (command, mut env) = self.command_and_env().await?;
         if let Some(profile_env) = &self.cmd.env {

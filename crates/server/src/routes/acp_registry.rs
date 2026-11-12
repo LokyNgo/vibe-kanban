@@ -10,7 +10,10 @@ use deployment::Deployment;
 use executors::{
     executors::{
         BaseCodingAgent, CodingAgent,
-        acp::registry::{self, RegistryAgent, registry_key},
+        acp::{
+            binary,
+            registry::{self, Launch, RegistryAgent, registry_key},
+        },
         acp_server::AcpServer,
     },
     profile::{ExecutorConfigs, ExecutorProfile},
@@ -97,6 +100,13 @@ async fn install_agent(
         )));
     }
 
+    // Download a binary agent now, so a failure shows here and not on the first run
+    if let Some(Launch::Binary(target)) = agent.distribution.launch() {
+        binary::command(&agent.id, &agent.version, &target)
+            .await
+            .map_err(executors::executors::ExecutorError::from)?;
+    }
+
     let mut profile = ExecutorProfile {
         recently_used_models: None,
         configurations: HashMap::new(),
@@ -133,6 +143,11 @@ async fn uninstall_agent(
     profiles.executors.remove(&key);
     profiles.save_overrides()?;
     ExecutorConfigs::reload();
+
+    // No-op for npx agents. The agent is already uninstalled, so only log
+    if let Err(e) = binary::remove(&id).await {
+        tracing::warn!("Failed to delete the files of ACP agent '{id}': {e}");
+    }
 
     Ok(ResponseJson(ApiResponse::success(())))
 }

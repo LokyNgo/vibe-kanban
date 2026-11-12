@@ -1,3 +1,4 @@
+pub mod binary;
 pub mod client;
 pub mod discovery;
 pub mod harness;

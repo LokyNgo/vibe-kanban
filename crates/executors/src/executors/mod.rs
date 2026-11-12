@@ -97,6 +97,8 @@ pub enum ExecutorError {
     InvalidAcpRegistryPackage { id: String, package: String },
     #[error(transparent)]
     AcpRegistry(#[from] acp::registry::RegistryError),
+    #[error(transparent)]
+    AcpBinary(#[from] acp::binary::BinaryError),
 }
 
 #[enum_dispatch]

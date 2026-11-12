@@ -9,6 +9,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use super::binary;
 use crate::{
     command::CommandBuilder,
     executors::{BaseCodingAgent, ExecutorError},
@@ -26,6 +27,10 @@ const HIDDEN_IDS: &[&str] = &[
     "factory-droid",
     "claude-acp",
     "codex-acp",
+    // Binary-only entries
+    "amp-acp",
+    "cursor",
+    "opencode",
 ];
 
 static REGISTRY_CACHE: LazyLock<RwLock<Option<Vec<RegistryAgent>>>> =
@@ -53,7 +58,27 @@ pub struct RegistryAgent {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Distribution {
     pub npx: Option<NpxDistribution>,
-} // binary/uvx are ignored for now
+    /// Keyed by platform, e.g. `darwin-aarch64` or `linux-x86_64-musl`
+    #[serde(default, deserialize_with = "valid_binary_targets")]
+    pub binary: HashMap<String, BinaryTarget>,
+} // uvx is ignored for now
+
+impl Distribution {
+    /// How to start the agent on this machine. npx wins when both exist: it
+    /// needs no download step and is what earlier installs already run.
+    pub fn launch(&self) -> Option<Launch> {
+        if let Some(npx) = &self.npx {
+            return Some(Launch::Npx(npx.clone()));
+        }
+        binary::host_target(&self.binary).map(|target| Launch::Binary(target.clone()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Launch {
+    Npx(NpxDistribution),
+    Binary(BinaryTarget),
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NpxDistribution {
@@ -62,6 +87,34 @@ pub struct NpxDistribution {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// An archive for one platform, holding the agent's executable.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinaryTarget {
+    pub archive: String,
+    /// Path of the executable inside the unpacked archive
+    pub cmd: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Required: an archive that can't be verified is never run
+    pub sha256: String,
+}
+
+/// Drops the platforms that don't parse (a missing sha256, say) rather than
+/// failing the agent, which may still have other platforms or npx.
+fn valid_binary_targets<'de, D>(deserializer: D) -> Result<HashMap<String, BinaryTarget>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<HashMap<String, serde_json::Value>>::deserialize(deserializer)?;
+    Ok(raw
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(platform, value)| Some((platform, serde_json::from_value(value).ok()?)))
+        .collect())
 }
 
 #[derive(Debug, Error)]
@@ -99,11 +152,12 @@ pub fn parse_registry(json: &str) -> Result<Vec<RegistryAgent>, serde_json::Erro
         .collect())
 }
 
-/// Agents users can install: npx-distributed and without a built-in executor.
+/// Agents users can install: runnable on this machine (npx, or a binary for
+/// this platform) and without a built-in executor.
 pub fn visible_agents(agents: &[RegistryAgent]) -> Vec<RegistryAgent> {
     agents
         .iter()
-        .filter(|agent| agent.distribution.npx.is_some())
+        .filter(|agent| agent.distribution.launch().is_some())
         .filter(|agent| !HIDDEN_IDS.contains(&agent.id.as_str()))
         .cloned()
         .collect()
@@ -302,6 +356,62 @@ mod tests {
         assert!(npx_of(&agents, "claude-acp").is_some());
         assert!(npx_of(&agents, "goose").is_none()); // no npx distribution
         assert!(npx_of(&agents, "unknown").is_none());
+    }
+
+    /// One binary-only agent with a target for `platform`.
+    fn binary_agent(platform: &str, target: &str) -> Vec<RegistryAgent> {
+        parse_registry(&format!(
+            r#"{{"agents": [{{"id": "kiro", "name": "Kiro CLI", "version": "3.0.0",
+                "distribution": {{"binary": {{"{platform}": {target}}}}}}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    const KIRO_TARGET: &str = r#"{
+        "archive": "https://example.com/kirocli.tar.gz",
+        "cmd": "./kirocli/bin/kiro-cli",
+        "args": ["acp", "--agent-engine=v3"],
+        "sha256": "fa32d8f2"
+    }"#;
+
+    #[test]
+    fn parse_registry_reads_binary_distribution() {
+        let agents = binary_agent("darwin-aarch64", KIRO_TARGET);
+        let target = &agents[0].distribution.binary["darwin-aarch64"];
+        assert_eq!(target.cmd, "./kirocli/bin/kiro-cli");
+        assert_eq!(target.args, ["acp", "--agent-engine=v3"]);
+        assert_eq!(target.sha256, "fa32d8f2");
+    }
+
+    #[test]
+    fn parse_registry_drops_binary_target_without_checksum() {
+        let unverified = r#"{"archive": "https://example.com/a.tar.gz", "cmd": "./a"}"#;
+        let agents = binary_agent("darwin-aarch64", unverified);
+        // The agent itself survives; it just has nothing to run
+        assert_eq!(ids(&agents), ["kiro"]);
+        assert!(agents[0].distribution.binary.is_empty());
+        assert!(visible_agents(&agents).is_empty());
+    }
+
+    #[test]
+    fn binary_agent_is_visible_on_its_platform_only() {
+        let platform = binary::host_platform().expect("tests run on a supported platform");
+        let agents = binary_agent(&platform, KIRO_TARGET);
+        assert_eq!(ids(&visible_agents(&agents)), ["kiro"]);
+        assert!(matches!(
+            agents[0].distribution.launch(),
+            Some(Launch::Binary(_))
+        ));
+
+        let agents = binary_agent("plan9-mips", KIRO_TARGET);
+        assert!(visible_agents(&agents).is_empty());
+    }
+
+    #[test]
+    fn launch_prefers_npx_over_binary() {
+        let agents = parse_registry(FIXTURE).unwrap();
+        let claude = agents.iter().find(|a| a.id == "claude-acp").unwrap();
+        assert!(matches!(claude.distribution.launch(), Some(Launch::Npx(_))));
     }
 
     fn kilo() -> NpxDistribution {
